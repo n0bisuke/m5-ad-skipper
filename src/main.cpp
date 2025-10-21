@@ -1,35 +1,147 @@
 #include "camera_pins.h"
 #include <WiFi.h>
 #include "esp_camera.h"
+#include "img_converters.h"
+#include <WiFiClientSecure.h>
+#include "secrets.h"   // DO NOT COMMIT（Wi-Fi / Gyazo の秘密を定義）
+#include "esp_log.h"
 
-// ==== 追加: WPA2-Enterprise 用ヘッダ ====
-// extern "C" {
-//   #include "esp_wifi.h"
-//   #include "esp_wpa2.h"   // WPA2-Enterprise
-// }
+#ifndef WIFI_SSID
+  #error "WIFI_SSID not defined. Define in secrets.h"
+#endif
 
-#include <WiFi.h>  // これは残す
+#if defined(WIFI_PASSWORD) && !defined(WIFI_PASSWORD_DISABLE)
+  #define WIFI_USE_WPA2_PSK 1
+#elif defined(EAP_USERNAME) && defined(EAP_PASSWORD)
+  #define WIFI_USE_WPA2_ENTERPRISE 1
+  #ifndef EAP_IDENTITY
+    #define EAP_IDENTITY EAP_USERNAME
+  #endif
+#else
+  #error "Define WIFI_PASSWORD for WPA2-PSK or EAP_USERNAME/EAP_PASSWORD for WPA2-Enterprise"
+#endif
 
-// ==== 構成スイッチ ====
-#define USE_ATOMS3R_CAM
-// #define USE_ATOMS3R_M12
+#ifndef GYAZO_ACCESS_TOKEN
+  #error "GYAZO_ACCESS_TOKEN not defined. Define in secrets.h"
+#endif
 
-#define STA_MODE
-// #define AP_MODE
+static const uint32_t CAPTURE_PERIOD_MS = 40 * 1000;  // 撮影～アップロード周期
 
-// ==== 秘密情報（git管理外） ====
-// ここで secrets.h から SSID / EAP 資格情報を取り込みます
-#include "secrets.h"
+static bool uploadToGyazo(const uint8_t* data, size_t len, const char* filename,
+                          const char* contentType, String& responseJson) {
+  if (!data || len == 0) return false;
 
-// ==== サーバ・カメラ用グローバル ====
-WiFiServer server(80);
-camera_fb_t* fb    = NULL;
-uint8_t* out_jpg   = NULL;
-size_t out_jpg_len = 0;
+  WiFiClientSecure client;
+  client.setInsecure();
 
-static void jpegStream(WiFiClient* client);
+  const char* host = "upload.gyazo.com";
+  const int   port = 443;
+  const char* boundary = "------------------------ESP32GyazoBoundary7e3c9a0";
 
-// ==== カメラ設定 ====
+  String head;
+  head += "--"; head += boundary; head += "\r\n";
+  head += "Content-Disposition: form-data; name=\"imagedata\"; filename=\"";
+  head += (filename ? filename : "snapshot.jpg");
+  head += "\"\r\n";
+  head += "Content-Type: ";
+  head += (contentType ? contentType : "application/octet-stream");
+  head += "\r\n\r\n";
+
+  String tail;
+  tail += "\r\n--"; tail += boundary; tail += "--\r\n";
+
+  size_t contentLength = head.length() + len + tail.length();
+
+  if (!client.connect(host, port)) {
+    Serial.println("[Gyazo] connect failed");
+    return false;
+  }
+  Serial.println("[Gyazo] connected");
+
+  String url = "/api/upload?access_token="; url += GYAZO_ACCESS_TOKEN;
+
+  client.printf("POST %s HTTP/1.1\r\n", url.c_str());
+  client.printf("Host: %s\r\n", host);
+  client.println("Connection: close");
+  client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary);
+  client.printf("Content-Length: %u\r\n", (unsigned)contentLength);
+  client.println();
+
+  client.print(head);
+  const size_t CHUNK = 8 * 1024;
+  size_t remain = len;
+  const uint8_t* p = data;
+  while (remain > 0) {
+    size_t n = (remain > CHUNK ? CHUNK : remain);
+    if (client.write(p, n) == 0) {
+      Serial.println("[Gyazo] write failed");
+      return false;
+    }
+    p += n;
+    remain -= n;
+    Serial.printf("[Gyazo] sent %u/%u bytes\n",
+                  (unsigned)(len - remain), (unsigned)len);
+  }
+  client.print(tail);
+  Serial.println("[Gyazo] payload sent, awaiting response");
+
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+  responseJson = client.readString();
+  Serial.println("[Gyazo] response: " + responseJson);
+  return responseJson.length() > 0;
+}
+
+static bool captureAndUploadPhoto() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("[Capture] fb_get failed");
+    return false;
+  }
+
+  Serial.printf("[Capture] frame obtained: %dx%d, %u bytes (format=%d)\n",
+                fb->width, fb->height, (unsigned)fb->len, fb->format);
+
+  uint8_t* jpg_buf = nullptr;
+  size_t jpg_len = 0;
+  const uint8_t* payload = fb->buf;
+  size_t payload_len = fb->len;
+  bool need_free = false;
+
+  if (fb->format == PIXFORMAT_JPEG) {
+    jpg_buf = nullptr;
+    jpg_len = 0;
+  } else {
+    if (!frame2jpg(fb, 80, &jpg_buf, &jpg_len)) {
+      Serial.println("[Capture] frame2jpg failed");
+      esp_camera_fb_return(fb);
+      return false;
+    }
+    payload = jpg_buf;
+    payload_len = jpg_len;
+    need_free = true;
+    Serial.printf("[Capture] converted to JPEG: %u bytes\n", (unsigned)payload_len);
+  }
+
+  esp_camera_fb_return(fb);
+
+  String resp;
+  bool ok = uploadToGyazo(payload, payload_len, "snapshot.jpg", "image/jpeg", resp);
+
+  if (need_free && jpg_buf) {
+    free(jpg_buf);
+  }
+
+  if (ok) {
+    Serial.println("[Task] upload OK");
+  } else {
+    Serial.println("[Task] upload FAILED");
+  }
+  return ok;
+}
+
 static camera_config_t camera_config = {
   .pin_pwdn     = PWDN_GPIO_NUM,
   .pin_reset    = RESET_GPIO_NUM,
@@ -50,166 +162,106 @@ static camera_config_t camera_config = {
   .xclk_freq_hz = 20000000,
   .ledc_timer   = LEDC_TIMER_0,
   .ledc_channel = LEDC_CHANNEL_0,
-#ifdef USE_ATOMS3R_CAM
   .pixel_format = PIXFORMAT_RGB565,
   .frame_size   = FRAMESIZE_QVGA,
-#endif
-#ifdef USE_ATOMS3R_M12
-  .pixel_format = PIXFORMAT_JPEG,
-  .frame_size   = FRAMESIZE_UXGA,
-#endif
-  .jpeg_quality  = 12,
-  .fb_count      = 2,
-  .fb_location   = CAMERA_FB_IN_PSRAM,
-  .grab_mode     = CAMERA_GRAB_LATEST,
+  .jpeg_quality = 12,
+  .fb_count     = 1,
+  .fb_location  = CAMERA_FB_IN_PSRAM,
+  .grab_mode    = CAMERA_GRAB_LATEST,
   .sccb_i2c_port = 0,
 };
 
-#include "esp_heap_caps.h"
-
-// ==== 便利マクロ（未定義チェック）====
-#ifndef WIFI_SSID
-  #error "WIFI_SSID not defined. Define in secrets.h"
-#endif
-#ifndef EAP_USERNAME
-  #error "EAP_USERNAME not defined. Define in secrets.h"
-#endif
-#ifndef EAP_PASSWORD
-  #error "EAP_PASSWORD not defined. Define in secrets.h"
-#endif
-#ifndef EAP_IDENTITY
-  // 一部環境では identity = username で問題ありません
-  #define EAP_IDENTITY EAP_USERNAME
-#endif
-
-void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.printf("psramFound=%d, free PSRAM=%u\n",
-                psramFound(),
-                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
-  // カメラ用電源ラインを明確にトグル
-  pinMode(POWER_GPIO_NUM, OUTPUT);
-  digitalWrite(POWER_GPIO_NUM, HIGH);  // 電源OFF想定
-  delay(50);
-  digitalWrite(POWER_GPIO_NUM, LOW);   // 電源ON想定（POWER_N）
-  delay(300);
-
-  // カメラ初期化
-  esp_err_t err = esp_camera_init(&camera_config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera Init Fail: 0x%08x\n", err);
-    delay(1000);
-    esp_restart();
-  }
-
-#ifdef STA_MODE
+#if defined(WIFI_USE_WPA2_ENTERPRISE)
+static void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.disconnect(true, true);
-
-  // secrets.h から読み込んだ値を使用
-  // 重要: WPA2-Enterprise 用のオーバーロードを使う
-  // 形式: WiFi.begin(ssid, WPA2_AUTH_PEAP, identity, username, password);
-  // 参考: 公式サンプル WiFiClientEnterprise.ino
+  Serial.println("[WiFi] connecting (WPA2-Enterprise / PEAP)...");
   WiFi.begin(WIFI_SSID, WPA2_AUTH_PEAP, EAP_IDENTITY, EAP_USERNAME, EAP_PASSWORD);
 
-  Serial.printf("Connecting to %s (WPA2-Enterprise/PEAP)", WIFI_SSID);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    if (millis() - t0 > 30000) { // タイムアウト再試行
-      Serial.println("\nRe-attempting connection...");
+    if (millis() - t0 > 30000) {
+      Serial.println("\n[WiFi] retry...");
       WiFi.disconnect(true, true);
       delay(300);
       WiFi.begin(WIFI_SSID, WPA2_AUTH_PEAP, EAP_IDENTITY, EAP_USERNAME, EAP_PASSWORD);
       t0 = millis();
     }
   }
-  Serial.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
-#endif
-
-#ifdef AP_MODE
-  // AP_MODE は通常の WPA2-PSK/AP 用。WPA2-Enterprise とは別経路です。
-  WiFi.softAP(WIFI_SSID, EAP_PASSWORD); // ※ここでは便宜的に流用（AP運用時のみ）
-  Serial.printf("AP IP address: %s\n", WiFi.softAPIP().toString().c_str());
-#endif
-
-  server.begin();
+  Serial.printf("\n[WiFi] connected. IP=%s\n", WiFi.localIP().toString().c_str());
 }
+#elif defined(WIFI_USE_WPA2_PSK)
+static void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(true, true);
+  Serial.println("[WiFi] connecting (WPA2-PSK)...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-// ==== MJPEG ストリーム ====
-#define PART_BOUNDARY "123456789000000000000987654321"
-static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char* _STREAM_BOUNDARY     = "\r\n--" PART_BOUNDARY "\r\n";
-static const char* _STREAM_PART         = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
-
-static void jpegStream(WiFiClient* client) {
-  Serial.println("Image stream start");
-  client->println("HTTP/1.1 200 OK");
-  client->printf("Content-Type: %s\r\n", _STREAM_CONTENT_TYPE);
-  client->println("Content-Disposition: inline; filename=capture.jpg");
-  client->println("Access-Control-Allow-Origin: *");
-  client->println();
-
-  static int64_t last_frame = 0;
-  if (!last_frame) last_frame = esp_timer_get_time();
-
-  for (;;) {
-    fb = esp_camera_fb_get();
-    if (fb) {
-#ifdef USE_ATOMS3R_CAM
-      frame2jpg(fb, 255, &out_jpg, &out_jpg_len);
-#endif
-#ifdef USE_ATOMS3R_M12
-      out_jpg     = fb->buf;
-      out_jpg_len = fb->len;
-#endif
-      client->print(_STREAM_BOUNDARY);
-      client->printf(_STREAM_PART, out_jpg_len);
-
-      int32_t remain = out_jpg_len;
-      uint8_t* p = out_jpg;
-      const uint32_t chunk = 8 * 1024;
-      while (remain > 0) {
-        int n = remain > (int32_t)chunk ? chunk : remain;
-        if (client->write(p, n) == 0) goto client_exit;
-        p += n; remain -= n;
-      }
-
-      int64_t now = esp_timer_get_time();
-      int64_t ms = (now - last_frame) / 1000;
-      last_frame = now;
-      Serial.printf("MJPG: %luKB %lums (%.1ffps)\n",
-                    (unsigned long)(out_jpg_len / 1024),
-                    (unsigned long)ms, 1000.0 / (double)ms);
-
-      esp_camera_fb_return(fb); fb = NULL;
-#ifdef USE_ATOMS3R_CAM
-      if (out_jpg) { free(out_jpg); out_jpg = NULL; out_jpg_len = 0; }
-#endif
-    } else {
-      Serial.println("Camera capture failed");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (millis() - t0 > 30000) {
+      Serial.println("\n[WiFi] retry...");
+      WiFi.disconnect(true, true);
+      delay(300);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      t0 = millis();
     }
   }
-client_exit:
-  if (fb) { esp_camera_fb_return(fb); fb = NULL; }
-#ifdef USE_ATOMS3R_CAM
-  if (out_jpg) { free(out_jpg); out_jpg = NULL; out_jpg_len = 0; }
+  Serial.printf("\n[WiFi] connected. IP=%s\n", WiFi.localIP().toString().c_str());
+}
 #endif
-  client->stop();
-  Serial.println("Image stream end");
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  esp_log_level_set("cam_hal", ESP_LOG_ERROR);
+  esp_log_level_set("camera", ESP_LOG_ERROR);
+  esp_log_level_set("sensor", ESP_LOG_WARN);
+
+  pinMode(POWER_GPIO_NUM, OUTPUT);
+  digitalWrite(POWER_GPIO_NUM, HIGH);
+  delay(50);
+  digitalWrite(POWER_GPIO_NUM, LOW);
+  delay(300);
+
+  if (esp_camera_init(&camera_config) != ESP_OK) {
+    Serial.println("[Cam] init failed. rebooting...");
+    delay(1000);
+    esp_restart();
+  }
+
+  connectWiFi();
 }
 
 void loop() {
-  WiFiClient client = server.available();
-  if (client) {
-    while (client.connected()) {
-      if (client.available()) jpegStream(&client);
-    }
-    client.stop();
-    Serial.println("Client Disconnected.");
+  static uint32_t lastUpload = 0;
+  static uint32_t lastProgress = 0;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] reconnecting...");
+    connectWiFi();
   }
+
+  if (millis() - lastUpload >= CAPTURE_PERIOD_MS) {
+    lastUpload = millis();
+    lastProgress = lastUpload;
+    Serial.println("[Task] capture + upload");
+    captureAndUploadPhoto();
+  } else if (millis() - lastProgress >= 5000) {
+    uint32_t elapsed = millis() - lastUpload;
+    if (elapsed < CAPTURE_PERIOD_MS) {
+      uint32_t remain = (CAPTURE_PERIOD_MS - elapsed) / 1000;
+      Serial.printf("[Task] waiting... next capture in %us\n", (unsigned)remain);
+    }
+    lastProgress = millis();
+  }
+
+  delay(50);
 }

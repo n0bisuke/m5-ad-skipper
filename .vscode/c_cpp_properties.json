@@ -10,6 +10,7 @@
             "includePath": [
                 "/Users/n0bisuke/ds/Arduino/m5/atoms3/atoms3r-cam/atoms3r-for-iotlt/include",
                 "/Users/n0bisuke/ds/Arduino/m5/atoms3/atoms3r-cam/atoms3r-for-iotlt/src",
+                "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                 "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
                 "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/newlib/platform_include",
                 "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/freertos/include",
@@ -239,7 +240,6 @@
                 "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/USB/src",
                 "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/Update/src",
                 "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src",
-                "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                 "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/WiFiProv/src",
                 "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
                 ""
@@ -249,6 +249,7 @@
                 "path": [
                     "/Users/n0bisuke/ds/Arduino/m5/atoms3/atoms3r-cam/atoms3r-for-iotlt/include",
                     "/Users/n0bisuke/ds/Arduino/m5/atoms3/atoms3r-cam/atoms3r-for-iotlt/src",
+                    "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                     "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
                     "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/newlib/platform_include",
                     "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/freertos/include",
@@ -478,7 +479,6 @@
                     "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/USB/src",
                     "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/Update/src",
                     "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src",
-                    "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                     "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/WiFiProv/src",
                     "/Users/n0bisuke/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
                     ""
@@ -492,7 +492,7 @@
                 "ARDUINO_EVENT_RUNNING_CORE=1",
                 "ESP32S3",
                 "BOARD_HAS_PSRAM",
-                "CORE_DEBUG_LEVEL=5",
+                "CORE_DEBUG_LEVEL=1",
                 "ARDUINO_USB_CDC_ON_BOOT=1",
                 "ARDUINO_USB_MODE=1",
                 "HAVE_CONFIG_H",
@@ -509,7 +509,7 @@
                 "ARDUINO=10812",
                 "ARDUINO_VARIANT=\"m5stack_atoms3\"",
                 "ARDUINO_BOARD=\"M5Stack AtomS3\"",
-                "ARDUINO_PARTITION_default",
+                "ARDUINO_PARTITION_default_8MB",
                 ""
             ],
             "cStandard": "gnu99",
