@@ -1,8 +1,14 @@
 #include "camera_pins.h"
 #include <WiFi.h>
 #include "esp_camera.h"
-#include "img_converters.h"
 #include <WiFiClientSecure.h>
+#include <LittleFS.h>
+#include <vector>
+#include <cstring>
+#include <cstdio>
+#include <algorithm>
+#include "img_converters.h"
+#include "gifenc.h"
 #include "secrets.h"   // DO NOT COMMIT（Wi-Fi / Gyazo の秘密を定義）
 #include "esp_log.h"
 
@@ -25,7 +31,361 @@
   #error "GYAZO_ACCESS_TOKEN not defined. Define in secrets.h"
 #endif
 
-static const uint32_t CAPTURE_PERIOD_MS = 40 * 1000;  // 撮影～アップロード周期
+static const uint32_t CAPTURE_PERIOD_MS = 10 * 1000;  // 撮影～アップロード周期
+static const uint32_t FRAME_COUNT = 5;
+static const uint32_t GIF_FRAME_DELAY_MS = 200;       // GIF再生時のフレーム間隔（ミリ秒）
+static const int GIF_W = 160;
+static const int GIF_H = 120;
+
+struct GifFrameRGB {
+  uint8_t* rgb; // GIF_W * GIF_H * 3 bytes
+};
+
+static std::vector<GifFrameRGB> g_gifFrames;
+static uint8_t g_palette[256 * 3];
+
+static bool uploadToGyazo(const uint8_t* data, size_t len, const char* filename,
+                          const char* contentType, String& responseJson);
+
+static void init332Palette() {
+  int n = 0;
+  for (int r = 0; r < 8; r++) {
+    for (int g = 0; g < 8; g++) {
+      for (int b = 0; b < 4; b++) {
+        uint8_t R = (r * 255) / 7;
+        uint8_t G = (g * 255) / 7;
+        uint8_t B = (b * 255) / 3;
+        g_palette[n * 3 + 0] = R;
+        g_palette[n * 3 + 1] = G;
+        g_palette[n * 3 + 2] = B;
+        n++;
+      }
+    }
+  }
+}
+
+static void freeGifFrames() {
+  for (auto& f : g_gifFrames) {
+    if (f.rgb) {
+      free(f.rgb);
+      f.rgb = nullptr;
+    }
+  }
+  g_gifFrames.clear();
+}
+
+static uint8_t* makeGifRGBFrame(const camera_fb_t* fb) {
+  if (!fb) return nullptr;
+  const int srcW = fb->width;
+  const int srcH = fb->height;
+  uint8_t* rgbFull = (uint8_t*)malloc(srcW * srcH * 3);
+  if (!rgbFull) return nullptr;
+
+  bool ok = fmt2rgb888(fb->buf, fb->len, (pixformat_t)fb->format, rgbFull);
+  if (!ok) {
+    free(rgbFull);
+    return nullptr;
+  }
+
+  uint8_t* rgb = (uint8_t*)malloc(GIF_W * GIF_H * 3);
+  if (!rgb) {
+    free(rgbFull);
+    return nullptr;
+  }
+
+  for (int y = 0; y < GIF_H; y++) {
+    int sy = (int)((int64_t)y * srcH / GIF_H);
+    const uint8_t* row = rgbFull + sy * srcW * 3;
+    for (int x = 0; x < GIF_W; x++) {
+      int sx = (int)((int64_t)x * srcW / GIF_W);
+      const uint8_t* srcPix = row + sx * 3;
+      int dst = (y * GIF_W + x) * 3;
+      // fmt2rgb888() returns data in BGR order for many sensors, swap to RGB
+      rgb[dst + 0] = srcPix[2];
+      rgb[dst + 1] = srcPix[1];
+      rgb[dst + 2] = srcPix[0];
+    }
+  }
+
+  free(rgbFull);
+  return rgb;
+}
+
+struct ColorBox {
+  int start;
+  int end;
+  uint8_t rmin, rmax, gmin, gmax, bmin, bmax;
+};
+
+static void updateColorBox(ColorBox& box, const std::vector<uint32_t>& colors, const std::vector<uint32_t>& order) {
+  uint8_t rmin = 255, rmax = 0, gmin = 255, gmax = 0, bmin = 255, bmax = 0;
+  for (int i = box.start; i < box.end; ++i) {
+    uint32_t c = colors[order[i]];
+    uint8_t r = (c >> 16) & 0xFF;
+    uint8_t g = (c >> 8) & 0xFF;
+    uint8_t b = c & 0xFF;
+    if (r < rmin) rmin = r;
+    if (r > rmax) rmax = r;
+    if (g < gmin) gmin = g;
+    if (g > gmax) gmax = g;
+    if (b < bmin) bmin = b;
+    if (b > bmax) bmax = b;
+  }
+  box.rmin = rmin; box.rmax = rmax;
+  box.gmin = gmin; box.gmax = gmax;
+  box.bmin = bmin; box.bmax = bmax;
+}
+
+static int longestAxis(const ColorBox& box) {
+  int rRange = box.rmax - box.rmin;
+  int gRange = box.gmax - box.gmin;
+  int bRange = box.bmax - box.bmin;
+  if (rRange >= gRange && rRange >= bRange) return 0;
+  if (gRange >= rRange && gRange >= bRange) return 1;
+  return 2;
+}
+
+static bool quantizeFramesToPalette(const std::vector<GifFrameRGB>& frames,
+                                    uint8_t* palette,
+                                    std::vector<std::vector<uint8_t>>& frameIndices) {
+  if (frames.empty()) return false;
+
+  const size_t pixelsPerFrame = GIF_W * GIF_H;
+  const size_t totalPixels = pixelsPerFrame * frames.size();
+
+  std::vector<uint32_t> colors(totalPixels);
+  std::vector<uint32_t> order(totalPixels);
+  for (size_t f = 0; f < frames.size(); ++f) {
+    const uint8_t* rgb = frames[f].rgb;
+    for (size_t p = 0; p < pixelsPerFrame; ++p) {
+      size_t idx = f * pixelsPerFrame + p;
+      uint8_t r = rgb[p * 3 + 0];
+      uint8_t g = rgb[p * 3 + 1];
+      uint8_t b = rgb[p * 3 + 2];
+      colors[idx] = (uint32_t(r) << 16) | (uint32_t(g) << 8) | b;
+      order[idx] = idx;
+    }
+  }
+
+  std::vector<ColorBox> boxes;
+  boxes.push_back({0, (int)totalPixels, 0, 255, 0, 255, 0, 255});
+  updateColorBox(boxes[0], colors, order);
+
+  while (boxes.size() < 256) {
+    int boxIndex = -1;
+    int maxRange = -1;
+    for (size_t i = 0; i < boxes.size(); ++i) {
+      if (boxes[i].end - boxes[i].start <= 1) continue;
+      int range = std::max({boxes[i].rmax - boxes[i].rmin,
+                            boxes[i].gmax - boxes[i].gmin,
+                            boxes[i].bmax - boxes[i].bmin});
+      if (range > maxRange) {
+        maxRange = range;
+        boxIndex = (int)i;
+      }
+    }
+    if (boxIndex < 0) break;
+
+    ColorBox box = boxes[boxIndex];
+    int axis = longestAxis(box);
+    auto begin = order.begin() + box.start;
+    auto midIter = order.begin() + (box.start + box.end) / 2;
+    auto end = order.begin() + box.end;
+
+    auto cmp = [&](uint32_t a, uint32_t b) {
+      uint8_t ar = (colors[a] >> 16) & 0xFF;
+      uint8_t ag = (colors[a] >> 8) & 0xFF;
+      uint8_t ab = colors[a] & 0xFF;
+      uint8_t br = (colors[b] >> 16) & 0xFF;
+      uint8_t bg = (colors[b] >> 8) & 0xFF;
+      uint8_t bb = colors[b] & 0xFF;
+      switch (axis) {
+        case 0: return ar < br;
+        case 1: return ag < bg;
+        default: return ab < bb;
+      }
+    };
+
+    std::nth_element(begin, midIter, end, cmp);
+
+    ColorBox boxA{box.start, (int)((box.start + box.end) / 2), 0,0,0,0,0,0};
+    ColorBox boxB{boxA.end, box.end, 0,0,0,0,0,0};
+    updateColorBox(boxA, colors, order);
+    updateColorBox(boxB, colors, order);
+
+    boxes[boxIndex] = boxA;
+    boxes.push_back(boxB);
+  }
+
+  if (boxes.size() > 256) boxes.resize(256);
+
+  std::vector<uint8_t> paletteIndex(totalPixels, 0);
+  for (size_t i = 0; i < boxes.size(); ++i) {
+    ColorBox& box = boxes[i];
+    uint64_t rSum = 0, gSum = 0, bSum = 0;
+    int count = box.end - box.start;
+    if (count == 0) count = 1;
+    for (int j = box.start; j < box.end; ++j) {
+      uint32_t c = colors[order[j]];
+      rSum += (c >> 16) & 0xFF;
+      gSum += (c >> 8) & 0xFF;
+      bSum += c & 0xFF;
+      paletteIndex[order[j]] = (uint8_t)i;
+    }
+    palette[i * 3 + 0] = (uint8_t)(rSum / count);
+    palette[i * 3 + 1] = (uint8_t)(gSum / count);
+    palette[i * 3 + 2] = (uint8_t)(bSum / count);
+  }
+
+  for (size_t i = boxes.size(); i < 256; ++i) {
+    palette[i * 3 + 0] = palette[i * 3 + 1] = palette[i * 3 + 2] = 0;
+  }
+
+  frameIndices.assign(frames.size(), std::vector<uint8_t>(pixelsPerFrame));
+  for (size_t idx = 0; idx < totalPixels; ++idx) {
+    size_t frame = idx / pixelsPerFrame;
+    size_t offset = idx % pixelsPerFrame;
+    frameIndices[frame][offset] = paletteIndex[idx];
+  }
+
+  return true;
+}
+
+static bool captureFramePrepare(uint8_t** jpegBufOut, size_t* jpegLenOut) {
+  *jpegBufOut = nullptr;
+  *jpegLenOut = 0;
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("[Capture] fb_get failed");
+    return false;
+  }
+
+  Serial.printf("[Capture] raw frame: %dx%d, %u bytes (format=%d)\n",
+                fb->width, fb->height, (unsigned)fb->len, fb->format);
+
+  uint8_t* gifRGB = makeGifRGBFrame(fb);
+  if (!gifRGB) {
+    Serial.println("[Capture] makeGifRGBFrame failed");
+    esp_camera_fb_return(fb);
+    return false;
+  }
+
+  size_t jpegLen = 0;
+  uint8_t* jpegBuf = nullptr;
+  if (fb->format == PIXFORMAT_JPEG) {
+    jpegLen = fb->len;
+    jpegBuf = (uint8_t*)malloc(jpegLen);
+    if (!jpegBuf) {
+      Serial.println("[Capture] jpeg buffer alloc failed");
+      if (gifRGB) free(gifRGB);
+      esp_camera_fb_return(fb);
+      return false;
+    }
+    memcpy(jpegBuf, fb->buf, jpegLen);
+  } else {
+    if (!frame2jpg(fb, 85, &jpegBuf, &jpegLen)) {
+      Serial.println("[Capture] frame2jpg failed");
+      if (gifRGB) free(gifRGB);
+      esp_camera_fb_return(fb);
+      return false;
+    }
+  }
+
+  esp_camera_fb_return(fb);
+
+  if (gifRGB) {
+    g_gifFrames.push_back({gifRGB});
+    Serial.printf("[Capture] converted frame #%u stored\n", (unsigned)g_gifFrames.size());
+  }
+
+  *jpegBufOut = jpegBuf;
+  *jpegLenOut = jpegLen;
+  return true;
+}
+
+static bool buildGifToLittleFS(int delay_ms) {
+  if (g_gifFrames.empty()) return false;
+
+  if (LittleFS.exists("/timelapse.gif")) {
+    LittleFS.remove("/timelapse.gif");
+  }
+
+  std::vector<std::vector<uint8_t>> frameIndices;
+  if (!quantizeFramesToPalette(g_gifFrames, g_palette, frameIndices)) {
+    Serial.println("[GIF] quantize failed");
+    return false;
+  }
+
+  ge_GIF* gif = ge_new_gif(
+      "/littlefs/timelapse.gif",
+      (uint16_t)GIF_W,
+      (uint16_t)GIF_H,
+      g_palette,
+      8,
+      0,
+      0);
+  if (!gif) {
+    Serial.println("[GIF] ge_new_gif failed");
+    return false;
+  }
+
+  uint16_t delay_cs = (delay_ms <= 0 ? 10 : (uint16_t)(delay_ms / 10));
+  for (size_t i = 0; i < frameIndices.size(); ++i) {
+    memcpy(gif->frame, frameIndices[i].data(), GIF_W * GIF_H);
+    ge_add_frame(gif, delay_cs);
+    Serial.printf("[GIF] frame %u appended (delay=%u cs)\n",
+                  (unsigned)(i + 1), (unsigned)delay_cs);
+  }
+
+  ge_close_gif(gif);
+  Serial.println("[GIF] file closed");
+  return true;
+}
+
+static bool uploadGifIfReady() {
+  if (g_gifFrames.size() < FRAME_COUNT) return false;
+
+  if (!buildGifToLittleFS((int)GIF_FRAME_DELAY_MS)) {
+    freeGifFrames();
+    return false;
+  }
+
+  File f = LittleFS.open("/timelapse.gif", "r");
+  if (!f) {
+    Serial.println("[Task] open gif failed");
+    freeGifFrames();
+    return false;
+  }
+
+  size_t gifLen = f.size();
+  uint8_t* gifBuf = (uint8_t*)malloc(gifLen);
+  if (!gifBuf) {
+    Serial.println("[Task] gif buffer alloc failed");
+    f.close();
+    freeGifFrames();
+    LittleFS.remove("/timelapse.gif");
+    return false;
+  }
+  f.readBytes((char*)gifBuf, gifLen);
+  f.close();
+
+  Serial.printf("[Task] GIF built: %u bytes\n", (unsigned)gifLen);
+
+  String resp;
+  bool ok = uploadToGyazo(gifBuf, gifLen, "timelapse.gif", "image/gif", resp);
+
+  free(gifBuf);
+  freeGifFrames();
+  LittleFS.remove("/timelapse.gif");
+
+  if (ok) {
+    Serial.println("[Task] GIF upload OK");
+  } else {
+    Serial.println("[Task] GIF upload FAILED");
+  }
+  return ok;
+}
 
 static bool uploadToGyazo(const uint8_t* data, size_t len, const char* filename,
                           const char* contentType, String& responseJson) {
@@ -92,54 +452,6 @@ static bool uploadToGyazo(const uint8_t* data, size_t len, const char* filename,
   responseJson = client.readString();
   Serial.println("[Gyazo] response: " + responseJson);
   return responseJson.length() > 0;
-}
-
-static bool captureAndUploadPhoto() {
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("[Capture] fb_get failed");
-    return false;
-  }
-
-  Serial.printf("[Capture] frame obtained: %dx%d, %u bytes (format=%d)\n",
-                fb->width, fb->height, (unsigned)fb->len, fb->format);
-
-  uint8_t* jpg_buf = nullptr;
-  size_t jpg_len = 0;
-  const uint8_t* payload = fb->buf;
-  size_t payload_len = fb->len;
-  bool need_free = false;
-
-  if (fb->format == PIXFORMAT_JPEG) {
-    jpg_buf = nullptr;
-    jpg_len = 0;
-  } else {
-    if (!frame2jpg(fb, 80, &jpg_buf, &jpg_len)) {
-      Serial.println("[Capture] frame2jpg failed");
-      esp_camera_fb_return(fb);
-      return false;
-    }
-    payload = jpg_buf;
-    payload_len = jpg_len;
-    need_free = true;
-    Serial.printf("[Capture] converted to JPEG: %u bytes\n", (unsigned)payload_len);
-  }
-
-  esp_camera_fb_return(fb);
-
-  String resp;
-  bool ok = uploadToGyazo(payload, payload_len, "snapshot.jpg", "image/jpeg", resp);
-
-  if (need_free && jpg_buf) {
-    free(jpg_buf);
-  }
-
-  if (ok) {
-    Serial.println("[Task] upload OK");
-  } else {
-    Serial.println("[Task] upload FAILED");
-  }
-  return ok;
 }
 
 static camera_config_t camera_config = {
@@ -221,9 +533,11 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  esp_log_level_set("cam_hal", ESP_LOG_ERROR);
-  esp_log_level_set("camera", ESP_LOG_ERROR);
-  esp_log_level_set("sensor", ESP_LOG_WARN);
+  esp_log_level_set("*", ESP_LOG_WARN);
+  esp_log_level_set("cam_hal", ESP_LOG_NONE);
+  esp_log_level_set("camera", ESP_LOG_NONE);
+  esp_log_level_set("sensor", ESP_LOG_NONE);
+  Serial.setDebugOutput(false);
 
   pinMode(POWER_GPIO_NUM, OUTPUT);
   digitalWrite(POWER_GPIO_NUM, HIGH);
@@ -237,25 +551,48 @@ void setup() {
     esp_restart();
   }
 
+  init332Palette();
+
+  if (!LittleFS.begin(true)) {
+    Serial.println("[FS] LittleFS initial mount failed");
+  }
+
   connectWiFi();
 }
 
 void loop() {
-  static uint32_t lastUpload = 0;
+  static uint32_t lastCapture = 0;
   static uint32_t lastProgress = 0;
+  static uint32_t photoCount = 0;
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WiFi] reconnecting...");
     connectWiFi();
   }
 
-  if (millis() - lastUpload >= CAPTURE_PERIOD_MS) {
-    lastUpload = millis();
-    lastProgress = lastUpload;
-    Serial.println("[Task] capture + upload");
-    captureAndUploadPhoto();
+  if (millis() - lastCapture >= CAPTURE_PERIOD_MS) {
+    lastCapture = millis();
+    lastProgress = lastCapture;
+    photoCount++;
+    Serial.printf("[Task] capture #%u\n", (unsigned)photoCount);
+
+    uint8_t* jpegBuf = nullptr;
+    size_t jpegLen = 0;
+    if (captureFramePrepare(&jpegBuf, &jpegLen)) {
+      char name[32];
+      snprintf(name, sizeof(name), "snapshot_%lu.jpg", (unsigned long)photoCount);
+      String resp;
+      bool ok = uploadToGyazo(jpegBuf, jpegLen, name, "image/jpeg", resp);
+      free(jpegBuf);
+      if (ok) {
+        Serial.println("[Task] JPEG upload OK");
+      } else {
+        Serial.println("[Task] JPEG upload FAILED");
+      }
+      uploadGifIfReady();
+    }
   } else if (millis() - lastProgress >= 5000) {
-    uint32_t elapsed = millis() - lastUpload;
+    uint32_t elapsed = millis() - lastCapture;
     if (elapsed < CAPTURE_PERIOD_MS) {
       uint32_t remain = (CAPTURE_PERIOD_MS - elapsed) / 1000;
       Serial.printf("[Task] waiting... next capture in %us\n", (unsigned)remain);
