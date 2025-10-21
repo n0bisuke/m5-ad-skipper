@@ -1,6 +1,6 @@
 # ATOMS3R-CAM Gyazo GIF Snapshot
 
-M5Stack ATOMS3R-CAM で短いバースト撮影を行い、3 枚のフレームを GIF アニメーションにして Gyazo へアップロードするファームウェアです。
+M5Stack ATOMS3R-CAM で 10 秒ごとにフレームを撮影し、3 枚溜まるごとに GIF を生成して Gyazo へアップロードするファームウェアです。
 
 ## 主な機能
 - `secrets.h` に設定した認証方式（WPA/WPA2-PSK または WPA2-Enterprise/PEAP）で Wi-Fi 接続。
